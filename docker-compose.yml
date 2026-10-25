@@ -1,0 +1,36 @@
+services:
+  api:
+    build: ./backend
+    environment:
+      DATABASE_PATH: /app/data/clinical_compass.db
+      ALLOWED_ORIGINS: http://localhost:5173,http://localhost:5174
+      FLASK_SECRET_KEY: ${FLASK_SECRET_KEY:-development-only-secret}
+      DATA_ENCRYPTION_KEY_PATH: /app/keys/data_encryption_key
+    volumes:
+      - compass-data:/app/data
+      - compass-key:/app/keys
+    ports:
+      - "5000:5000"
+    restart: unless-stopped
+
+  doctor-ui:
+    build:
+      context: ./doctor-ui
+    ports:
+      - "5173:80"
+    depends_on:
+      - api
+    restart: unless-stopped
+
+  patient-ui:
+    build:
+      context: ./patient-ui
+    ports:
+      - "5174:80"
+    depends_on:
+      - api
+    restart: unless-stopped
+
+volumes:
+  compass-data:
+  compass-key:

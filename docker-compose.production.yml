@@ -1,0 +1,46 @@
+services:
+  api:
+    build: ./backend
+    environment:
+      DATABASE_PATH: /app/data/clinical_compass.db
+      ALLOWED_ORIGINS: https://${DOCTOR_DOMAIN},https://${PATIENT_DOMAIN}
+      FLASK_SECRET_KEY: ${FLASK_SECRET_KEY}
+      DATA_ENCRYPTION_KEY: ${DATA_ENCRYPTION_KEY}
+    volumes:
+      - compass-data:/app/data
+    restart: unless-stopped
+
+  doctor-ui:
+    build: ./doctor-ui
+    depends_on:
+      - api
+    restart: unless-stopped
+
+  patient-ui:
+    build: ./patient-ui
+    depends_on:
+      - api
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2-alpine
+    environment:
+      DOCTOR_DOMAIN: ${DOCTOR_DOMAIN}
+      PATIENT_DOMAIN: ${PATIENT_DOMAIN}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - doctor-ui
+      - patient-ui
+    restart: unless-stopped
+
+volumes:
+  compass-data:
+  caddy-data:
+  caddy-config:
