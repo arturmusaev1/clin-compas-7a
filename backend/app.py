@@ -587,6 +587,8 @@ def user_payload(db, user):
     if user["role"] == "doctor":
         doctor = db.execute("SELECT * FROM doctors WHERE id=?", (user["entity_id"],)).fetchone()
         base["profile"] = dict(doctor)
+        for key in ("is_chief","is_on_call","active"):
+            base["profile"][key] = bool(base["profile"].get(key))
     else:
         profile = latest(db, user["entity_id"], "profile")
         base["profile"] = profile
@@ -786,6 +788,8 @@ def doctor_dashboard():
     doctor_id = g.user["entity_id"]
     with get_db() as db:
         doctor = dict(db.execute("SELECT * FROM doctors WHERE id=?", (doctor_id,)).fetchone())
+        for key in ("is_chief","is_on_call","active"):
+            doctor[key] = bool(doctor.get(key))
         if doctor.get("is_chief"):
             patient_ids = [row[0] for row in db.execute("SELECT id FROM patients ORDER BY id").fetchall()]
         else:
@@ -1319,6 +1323,7 @@ def assign_questionnaire(patient_id):
     try:
         due_date = date.fromisoformat(str(payload.get("due_date", "")))
         repeat_weeks = max(0, min(52, int(payload.get("repeat_weeks", 1))))
+        total_runs = max(1, min(52, int(payload.get("total_runs", 1 if repeat_weeks == 0 else 4))))
     except (TypeError, ValueError):
         return jsonify({"error":"Проверьте дату и периодичность"}),400
     if due_date < date.today():
@@ -1330,7 +1335,8 @@ def assign_questionnaire(patient_id):
         doctor = db.execute("SELECT name FROM doctors WHERE id=?", (doctor_id,)).fetchone()
         document = {
             "questionnaire_code":code, "title":questionnaire["title"], "due_date":due_date.isoformat(),
-            "repeat_weeks":repeat_weeks, "doctor_id":doctor_id, "doctor_name":doctor["name"],
+            "repeat_weeks":repeat_weeks, "total_runs":total_runs, "remaining_runs":total_runs,
+            "doctor_id":doctor_id, "doctor_name":doctor["name"],
         }
         record_id = insert_secure(db,patient_id,"questionnaire_assignment",document,status="active")
         return jsonify(document|{"id":record_id,"status":"active"}),201
@@ -1361,11 +1367,14 @@ def submit_questionnaire():
         record_id = insert_secure(db,patient_id,"questionnaire_response",document,status="completed")
         db.execute("UPDATE secure_records SET status='completed' WHERE id=?", (assignment_id,))
         repeat_weeks = int(assignment.get("repeat_weeks",0) or 0)
-        if repeat_weeks:
+        remaining_runs = int(assignment.get("remaining_runs",1) or 1)
+        if repeat_weeks and remaining_runs > 1:
             next_due = date.fromisoformat(assignment["due_date"]) + timedelta(weeks=repeat_weeks)
             while next_due <= date.today():
                 next_due += timedelta(weeks=repeat_weeks)
             next_document = {key:assignment[key] for key in ("questionnaire_code","title","repeat_weeks","doctor_id","doctor_name")}
+            next_document["total_runs"] = int(assignment.get("total_runs",remaining_runs))
+            next_document["remaining_runs"] = remaining_runs - 1
             next_document["due_date"] = next_due.isoformat()
             insert_secure(db,patient_id,"questionnaire_assignment",next_document,status="active")
         if questionnaire["code"].startswith("phq") and any(item["question_id"]=="9" and item["score"]>0 for item in answers):
