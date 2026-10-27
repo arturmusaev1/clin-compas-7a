@@ -1,0 +1,11 @@
+.git
+**/.venv
+**/node_modules
+**/dist
+**/__pycache__
+backend/data
+.codex-presentation
+.chart-data-*
+presentation-output
+*.pptx
+*.pdf

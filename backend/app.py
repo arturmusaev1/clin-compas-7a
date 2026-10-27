@@ -15,6 +15,7 @@ from werkzeug.security import check_password_hash, generate_password_hash
 BASE_DIR = Path(__file__).resolve().parent
 DATABASE_PATH = Path(os.getenv("DATABASE_PATH", BASE_DIR / "data" / "clinical_compass.db"))
 KEY_PATH = Path(os.getenv("DATA_ENCRYPTION_KEY_PATH", BASE_DIR / "data" / ".data_encryption_key"))
+QUESTIONNAIRE_DIR = BASE_DIR / "questionnaires" if (BASE_DIR / "questionnaires").exists() else BASE_DIR.parent / "Опросники"
 KEY_FILE = os.getenv("DATA_ENCRYPTION_KEY_FILE")
 SLOTS = ("09:30", "11:00", "12:30", "15:30", "17:00")
 MOSCOW_TZ = timezone(timedelta(hours=3))
@@ -98,7 +99,112 @@ def latest(db, patient_id, record_type):
     return decrypt_record(row) if row else None
 
 
+def questionnaire_catalog():
+    output = []
+    if not QUESTIONNAIRE_DIR.exists():
+        return output
+    for path in sorted(QUESTIONNAIRE_DIR.glob("*.json")):
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        meta = raw.get("meta", {})
+        audience = "doctor" if "doctor" in path.stem.lower() else "patient"
+        code = str(meta.get("id") or path.stem).lower()
+        title = raw.get("name") or meta.get("name") or code.upper()
+        description = raw.get("description") or meta.get("description") or ""
+        period = raw.get("time_period") or meta.get("time_period") or ""
+        questions = []
+        for question in raw.get("questions", []):
+            prompt = question.get("question") or question.get("text") or question.get("situation") or ""
+            direct_options = question.get("options")
+            if direct_options:
+                questions.append({"id":str(question["id"]), "prompt":prompt, "options":direct_options})
+            elif raw.get("rating_scales"):
+                for axis, scale in raw["rating_scales"].items():
+                    questions.append({
+                        "id":f"{question['id']}:{axis}",
+                        "prompt":f"{prompt} — {scale.get('label', axis)}",
+                        "options":scale.get("options", []),
+                    })
+            else:
+                questions.append({
+                    "id":str(question["id"]), "prompt":prompt,
+                    "options":raw.get("rating_scale", {}).get("options", []),
+                })
+        max_score = meta.get("max_score") or raw.get("scoring", {}).get("max_score")
+        if max_score is None:
+            max_score = sum(max((int(option.get("score", 0)) for option in item["options"]), default=0) for item in questions)
+        output.append({
+            "code":code, "audience":audience, "title":title, "description":description,
+            "time_period":period, "questions":questions, "max_score":max_score,
+            "scoring":raw.get("scoring", {}),
+        })
+    return output
+
+
+def questionnaire_by_code(code, audience=None):
+    return next((item for item in questionnaire_catalog() if item["code"] == code and (not audience or item["audience"] == audience)), None)
+
+
+def score_questionnaire(questionnaire, submitted):
+    if not isinstance(submitted, dict):
+        raise ValueError("Ответьте на все вопросы")
+    answers = []
+    total = 0
+    for question in questionnaire["questions"]:
+        key = question["id"]
+        try:
+            score = int(submitted[key])
+        except (KeyError, TypeError, ValueError):
+            raise ValueError("Ответьте на все вопросы")
+        option = next((item for item in question["options"] if int(item.get("score", -999)) == score), None)
+        if option is None:
+            raise ValueError("Один из ответов не соответствует шкале")
+        answers.append({"question_id":key, "question":question["prompt"], "score":score, "answer":option.get("text", str(score))})
+        total += score
+    scoring = questionnaire.get("scoring", {})
+    interpretations = scoring.get("interpretation") or scoring.get("interpretation_total") or []
+    level = "Результат сохранён"
+    recommendation = ""
+    for item in interpretations:
+        minimum, maximum = item.get("min"), item.get("max")
+        if minimum is None and item.get("range"):
+            try:
+                minimum, maximum = [float(value) for value in item["range"].split("-")]
+            except (TypeError, ValueError):
+                continue
+        if minimum is not None and maximum is not None and float(minimum) <= total <= float(maximum):
+            level = item.get("level", level)
+            recommendation = item.get("recommendation", "")
+            break
+    return answers, total, level, recommendation
+
+
+def add_score_dynamics(items):
+    """Add a same-scale delta without changing the encrypted clinical record."""
+    for index, item in enumerate(items):
+        previous = next((older for older in items[index + 1:] if older.get("questionnaire_code") == item.get("questionnaire_code")), None)
+        if previous is not None:
+            item["score_delta"] = int(item.get("score", 0)) - int(previous.get("score", 0))
+    return items
+
+
+def doctor_slots(doctor):
+    start = str(doctor["work_start"] or "09:00")
+    end = str(doctor["work_end"] or "18:00")
+    minutes = max(15, min(240, int(doctor["slot_minutes"] or 60)))
+    try:
+        cursor = datetime.combine(date.today(), datetime.strptime(start, "%H:%M").time())
+        finish = datetime.combine(date.today(), datetime.strptime(end, "%H:%M").time())
+    except ValueError:
+        return list(SLOTS)
+    output = []
+    while cursor + timedelta(minutes=minutes) <= finish:
+        output.append(cursor.strftime("%H:%M"))
+        cursor += timedelta(minutes=minutes)
+    return output
+
+
 RISK_RULESET_VERSION = "safety-v1"
+ADHERENCE_RULESET_VERSION = "medication-adherence-v1"
 LEGAL_DOCUMENT_VERSION = "legal-v1-2026-10-25"
 LEGAL_OPERATOR = {
     "name": "[ПОЛНОЕ НАИМЕНОВАНИЕ ООО / ФИО ИП]",
@@ -205,17 +311,17 @@ def evaluate_safety_risk(payload, previous_checkin=None):
             triggers.append(("SUDDEN_WORSENING", "Пациент отметил резкое ухудшение состояния"))
         if previous_checkin:
             mood_drop = int(previous_checkin.get("mood", mood)) - mood
-            anxiety_drop = int(previous_checkin.get("anxiety", anxiety)) - anxiety
-            if mood_drop >= 3 or anxiety_drop >= 3:
+            anxiety_rise = anxiety - int(previous_checkin.get("anxiety", anxiety))
+            if mood_drop >= 3 or anxiety_rise >= 3:
                 triggers.append(("RAPID_SCALE_DECLINE", "Показатели ухудшились на 3 или более пункта"))
         if triggers:
             level = "urgent"
-        elif mood <= 3 or anxiety <= 3 or sleep < 5:
+        elif mood <= 3 or anxiety >= 7 or sleep < 5:
             level = "observation"
             if mood <= 3:
                 triggers.append(("LOW_MOOD", f"Настроение {mood}/10"))
-            if anxiety <= 3:
-                triggers.append(("LOW_ANXIETY_WELLBEING", f"Самооценка тревоги {anxiety}/10"))
+            if anxiety >= 7:
+                triggers.append(("HIGH_ANXIETY", f"Тревога {anxiety}/10"))
             if sleep < 5:
                 triggers.append(("SHORT_SLEEP", f"Сон {sleep:g} ч"))
 
@@ -233,6 +339,92 @@ def evaluate_safety_risk(payload, previous_checkin=None):
         "recommendation": recommendations[level],
         "answers": flags,
     }
+
+
+def normalized_anxiety(item):
+    """Return anxiety on the current scale: 0 means none, 10 means severe."""
+    value = max(0, min(10, int(item.get("anxiety", 0))))
+    return 10 - value if int(item.get("scale_version", 1)) == 2 else value
+
+
+def medication_adherence(db, patient_id, prescriptions=None):
+    today = date.today()
+    prescriptions = prescriptions if prescriptions is not None else records(db, patient_id, "prescription", True)
+    intakes = records(db, patient_id, "medication_intake", True)
+    output = {}
+    for prescription in prescriptions:
+        if prescription.get("status") != "active":
+            continue
+        taken_dates = []
+        for intake in intakes:
+            if intake.get("prescription_id") != prescription["id"]:
+                continue
+            try:
+                taken_dates.append(date.fromisoformat(intake.get("taken_on", intake["created_at"][:10])))
+            except (TypeError, ValueError):
+                continue
+        try:
+            started = date.fromisoformat(prescription.get("started_at", prescription["created_at"][:10]))
+        except (TypeError, ValueError):
+            started = today
+        last_taken = max(taken_dates) if taken_dates else started
+        missed_days = max(0, (today - last_taken).days)
+        level = "critical" if missed_days >= 14 else "urgent" if missed_days >= 7 else "observation" if missed_days >= 3 else "none"
+        output[prescription["id"]] = {
+            "taken_today": today in taken_dates,
+            "last_taken_on": max(taken_dates).isoformat() if taken_dates else None,
+            "tracking_started_on": started.isoformat(),
+            "missed_days": missed_days,
+            "adherence_level": level,
+            "adherence_cycle": last_taken.isoformat(),
+        }
+    return output
+
+
+def sync_medication_adherence_alerts(db, patient_id):
+    prescriptions = records(db, patient_id, "prescription", True)
+    states = medication_adherence(db, patient_id, prescriptions)
+    alert_rows = db.execute(
+        "SELECT * FROM secure_records WHERE patient_id=? AND record_type='alert' ORDER BY id DESC",
+        (patient_id,),
+    ).fetchall()
+    alerts = [(row, decrypt_record(row)) for row in alert_rows]
+    for prescription in prescriptions:
+        if prescription.get("status") != "active":
+            continue
+        state = states[prescription["id"]]
+        prescription_alerts = [
+            (row, item) for row, item in alerts
+            if item.get("alert_kind") == "medication_adherence"
+            and item.get("prescription_id") == prescription["id"]
+        ]
+        related = [
+            (row, item) for row, item in prescription_alerts
+            if item.get("adherence_cycle") == state["adherence_cycle"]
+        ]
+        active = [(row, item) for row, item in prescription_alerts if row["status"] in {"new", "acknowledged"}]
+        target = state["adherence_level"]
+        if target == "none":
+            for row, _ in active:
+                db.execute("UPDATE secure_records SET status='resolved' WHERE id=?", (row["id"],))
+            continue
+        if any(item.get("severity") == target for _, item in related):
+            continue
+        for row, _ in active:
+            db.execute("UPDATE secure_records SET status='resolved' WHERE id=?", (row["id"],))
+        labels = {"observation":"Наблюдение", "urgent":"Срочный", "critical":"Критический"}
+        insert_secure(db, patient_id, "alert", {
+            "title": f"{labels[target]} сигнал: пропуски препарата",
+            "description": f"{prescription['name']}: нет отметки о приёме {state['missed_days']} дн.",
+            "recommendation": "Связаться с пациентом и уточнить фактический приём препарата.",
+            "rule_codes": [f"MEDICATION_MISSED_{3 if target == 'observation' else 7 if target == 'urgent' else 14}_DAYS"],
+            "ruleset_version": ADHERENCE_RULESET_VERSION,
+            "alert_kind": "medication_adherence",
+            "prescription_id": prescription["id"],
+            "adherence_cycle": state["adherence_cycle"],
+            "severity": target,
+        }, severity=target, status="new")
+    return states
 
 
 def create_schema():
@@ -266,7 +458,11 @@ def create_schema():
             CREATE TABLE IF NOT EXISTS doctors(
               id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, specialty TEXT NOT NULL,
               experience INTEGER NOT NULL DEFAULT 0, clinic TEXT NOT NULL DEFAULT '', rating REAL NOT NULL DEFAULT 5,
-              price INTEGER NOT NULL DEFAULT 2500, about TEXT NOT NULL DEFAULT ''
+              price INTEGER NOT NULL DEFAULT 2500, about TEXT NOT NULL DEFAULT '',
+              work_days TEXT NOT NULL DEFAULT '1,2,3,4,5', work_start TEXT NOT NULL DEFAULT '09:00',
+              work_end TEXT NOT NULL DEFAULT '18:00', slot_minutes INTEGER NOT NULL DEFAULT 60,
+              is_chief INTEGER NOT NULL DEFAULT 0, is_on_call INTEGER NOT NULL DEFAULT 0,
+              active INTEGER NOT NULL DEFAULT 1
             );
             CREATE TABLE IF NOT EXISTS patients(
               id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL
@@ -310,10 +506,24 @@ def create_schema():
             db.execute("ALTER TABLE medicines ADD COLUMN minimum_age TEXT NOT NULL DEFAULT '18 лет'")
         if "contraindications" not in medicine_columns:
             db.execute("ALTER TABLE medicines ADD COLUMN contraindications TEXT NOT NULL DEFAULT ''")
+        doctor_columns = {row[1] for row in db.execute("PRAGMA table_info(doctors)").fetchall()}
+        doctor_additions = {
+            "work_days":"TEXT NOT NULL DEFAULT '1,2,3,4,5'", "work_start":"TEXT NOT NULL DEFAULT '09:00'",
+            "work_end":"TEXT NOT NULL DEFAULT '18:00'", "slot_minutes":"INTEGER NOT NULL DEFAULT 60",
+            "is_chief":"INTEGER NOT NULL DEFAULT 0", "is_on_call":"INTEGER NOT NULL DEFAULT 0",
+            "active":"INTEGER NOT NULL DEFAULT 1",
+        }
+        for column, definition in doctor_additions.items():
+            if column not in doctor_columns:
+                db.execute(f"ALTER TABLE doctors ADD COLUMN {column} {definition}")
         if old_relations:
             db.executemany("INSERT OR IGNORE INTO patient_doctors(patient_id,doctor_id,created_at) VALUES(?,?,?)", [(patient_id,doctor_id,datetime.now().isoformat(timespec="seconds")) for patient_id,doctor_id in old_relations])
         db.execute("INSERT OR IGNORE INTO patient_stats(patient_id) SELECT id FROM patients")
         db.execute("UPDATE doctors SET price=2500 WHERE price IS NULL OR price<=0")
+        if db.execute("SELECT COUNT(*) FROM doctors WHERE is_chief=1 AND active=1").fetchone()[0] == 0:
+            first_doctor = db.execute("SELECT id FROM doctors WHERE active=1 ORDER BY id LIMIT 1").fetchone()
+            if first_doctor:
+                db.execute("UPDATE doctors SET is_chief=1 WHERE id=?", (first_doctor["id"],))
         medicines = [
             (1,"Авиандр","Фабомотизол","Анксиолитик","1 таблетка 2 раза в сутки","4–6 недель","Головная боль|Головокружение|Сонливость|Слабость","Аллергическая реакция|Резкое ухудшение","Контроль переносимости через 2 недели"),
             (2,"Эсциталопрам","Эсциталопрам","СИОЗС","10–20 мг/сут","4–6 недель","Тошнота|Головная боль|Изменения сна|Потливость","Серотониновый синдром|Суицидальные мысли","Контроль тревоги, настроения и переносимости"),
@@ -435,9 +645,10 @@ def register():
     try:
         with get_db() as db:
             if role == "doctor":
-                cursor = db.execute("INSERT INTO doctors(name,specialty,experience,clinic,price,about) VALUES(?,?,?,?,?,?)", (
+                is_first_doctor = db.execute("SELECT COUNT(*) FROM doctors WHERE active=1").fetchone()[0] == 0
+                cursor = db.execute("INSERT INTO doctors(name,specialty,experience,clinic,price,about,is_chief) VALUES(?,?,?,?,?,?,?)", (
                     name, str(payload.get("specialty", "Психиатр")), int(payload.get("experience", 0)),
-                    str(payload.get("clinic", "Частная практика")), 2500, str(payload.get("about", ""))))
+                    str(payload.get("clinic", "Частная практика")), 2500, str(payload.get("about", "")), int(is_first_doctor)))
                 entity_id = cursor.lastrowid
             else:
                 cursor = db.execute("INSERT INTO patients(created_at) VALUES(?)", (now,))
@@ -465,6 +676,10 @@ def login():
         user = db.execute("SELECT * FROM users WHERE email=?", (str(payload.get("email", "")).strip().lower(),)).fetchone()
         if not user or not check_password_hash(user["password_hash"], str(payload.get("password", ""))):
             return jsonify({"error":"Неверный email или пароль"}), 401
+        if user["role"] == "doctor":
+            doctor = db.execute("SELECT active FROM doctors WHERE id=?", (user["entity_id"],)).fetchone()
+            if not doctor or not doctor["active"]:
+                return jsonify({"error":"Учётная запись врача отключена главным врачом"}),403
         token = issue_session(db, user["id"])
         return jsonify({"token":token,"user":user_payload(db,user)})
 
@@ -490,7 +705,7 @@ def logout():
 def doctors():
     with get_db() as db:
         result = []
-        for row in db.execute("SELECT * FROM doctors ORDER BY name").fetchall():
+        for row in db.execute("SELECT * FROM doctors WHERE active=1 ORDER BY name").fetchall():
             item = dict(row)
             item["available_slots"] = available_slots(db, item["id"], 3)
             result.append(item)
@@ -498,11 +713,19 @@ def doctors():
 
 
 def available_slots(db, doctor_id, days=7):
+    doctor = db.execute("SELECT * FROM doctors WHERE id=? AND active=1", (doctor_id,)).fetchone()
+    if not doctor:
+        return []
+    work_days = {int(value) for value in str(doctor["work_days"] or "").split(",") if value.isdigit()}
+    slots = doctor_slots(doctor)
     booked = {(row["appointment_date"],row["appointment_time"]) for row in db.execute("SELECT appointment_date,appointment_time FROM appointment_slots WHERE doctor_id=?", (doctor_id,)).fetchall()}
     output = []
     for offset in range(1, days + 1):
-        target = (date.today() + timedelta(days=offset)).isoformat()
-        for slot in SLOTS:
+        target_date = date.today() + timedelta(days=offset)
+        if target_date.isoweekday() not in work_days:
+            continue
+        target = target_date.isoformat()
+        for slot in slots:
             output.append({"date":target,"time":slot,"available":(target,slot) not in booked})
     return output
 
@@ -511,16 +734,22 @@ def patient_summary(db, patient_id):
     profile = latest(db, patient_id, "profile")
     if not profile:
         return None
+    sync_medication_adherence_alerts(db, patient_id)
     checkins = records(db, patient_id, "checkin")
     for item in checkins:
-        if item.get("scale_version",1) < 2:
-            item["anxiety"] = max(0,min(10,10-int(item["anxiety"])))
+        item["anxiety"] = normalized_anxiety(item)
     assessments = records(db,patient_id,"assessment",True)
+    questionnaire_assignments = records(db,patient_id,"questionnaire_assignment",True)
+    questionnaire_responses = add_score_dynamics(records(db,patient_id,"questionnaire_response",True))
+    clinical_assessments = add_score_dynamics(records(db,patient_id,"clinical_assessment",True))
     prescriptions = records(db,patient_id,"prescription",True)
     diagnoses = records(db,patient_id,"diagnosis",True)
     consents = records(db,patient_id,"consent",True)
     current_consent = next((item for item in consents if item.get("version") == LEGAL_DOCUMENT_VERSION and item.get("status") == "active"), None)
     active_prescriptions = [item for item in prescriptions if item.get("status") == "active"]
+    adherence = medication_adherence(db, patient_id, prescriptions)
+    for item in prescriptions:
+        item.update(adherence.get(item["id"], {}))
     linked_doctors = [dict(row) for row in db.execute("""SELECT d.* FROM doctors d
         JOIN patient_doctors pd ON pd.doctor_id=d.id WHERE pd.patient_id=? ORDER BY d.name""", (patient_id,)).fetchall()]
     stats_row = db.execute("SELECT * FROM patient_stats WHERE patient_id=?", (patient_id,)).fetchone()
@@ -531,13 +760,20 @@ def patient_summary(db, patient_id):
         profile["dosage"] = "; ".join(f"{item['name']}: {item['dose']}" for item in active_prescriptions)
     if diagnoses:
         profile["diagnosis"] = ", ".join(item["name"] for item in diagnoses)
+    next_assessment_date = None
+    assessment_due = not assessments
+    due_questionnaires = [item for item in questionnaire_assignments if item.get("status")=="active" and item.get("due_date", "9999-12-31") <= date.today().isoformat()]
     profile.update({
         "patient_id":patient_id, "checkins":checkins, "latest_checkin":checkins[-1] if checkins else None,
         "alerts":records(db,patient_id,"alert",True), "alert_events":records(db,patient_id,"alert_event",True), "messages":records(db,patient_id,"message"),
         "appointments":records(db,patient_id,"appointment",True), "side_effect_reports":records(db,patient_id,"side_effect",True),
         "assessments":assessments, "visits":records(db,patient_id,"visit",True),
+        "questionnaire_assignments":questionnaire_assignments, "questionnaire_responses":questionnaire_responses,
+        "clinical_assessments":clinical_assessments, "due_questionnaires":due_questionnaires,
         "prescriptions":prescriptions, "diagnoses":diagnoses, "doctors":linked_doctors, "stats":stats,
         "needs_initial_assessment":not assessments,
+        "assessment_due":assessment_due,
+        "next_assessment_date":next_assessment_date.isoformat() if next_assessment_date else None,
         "needs_consent":current_consent is None,
         "consent_summary":({"version":current_consent["version"],"accepted_at":current_consent["accepted_at"],"subject_is_minor":current_consent.get("subject_is_minor",False)} if current_consent else None),
     })
@@ -550,11 +786,21 @@ def doctor_dashboard():
     doctor_id = g.user["entity_id"]
     with get_db() as db:
         doctor = dict(db.execute("SELECT * FROM doctors WHERE id=?", (doctor_id,)).fetchone())
-        patient_ids = [row[0] for row in db.execute("SELECT patient_id FROM patient_doctors WHERE doctor_id=? ORDER BY patient_id", (doctor_id,)).fetchall()]
+        if doctor.get("is_chief"):
+            patient_ids = [row[0] for row in db.execute("SELECT id FROM patients ORDER BY id").fetchall()]
+        else:
+            patient_ids = [row[0] for row in db.execute("SELECT patient_id FROM patient_doctors WHERE doctor_id=? ORDER BY patient_id", (doctor_id,)).fetchall()]
         patients = [patient_summary(db, item) for item in patient_ids]
         for patient in patients:
             patient["messages"] = [item for item in patient["messages"] if item.get("doctor_id")==doctor_id]
         alerts = [alert | {"patient_id":patient["patient_id"],"patient_name":patient["full_name"]} for patient in patients for alert in patient["alerts"] if alert.get("status") in {"new","acknowledged"}]
+        if doctor.get("is_on_call") and not doctor.get("is_chief"):
+            global_ids = [row[0] for row in db.execute("SELECT id FROM patients ORDER BY id").fetchall() if row[0] not in patient_ids]
+            for patient_id in global_ids:
+                patient = patient_summary(db,patient_id)
+                for alert in patient["alerts"]:
+                    if alert.get("status") in {"new","acknowledged"} and alert.get("severity") in {"urgent","critical"}:
+                        alerts.append(alert|{"patient_id":patient_id,"patient_name":patient["full_name"],"on_call":True})
         return jsonify({"doctor":doctor,"patients":patients,"alerts":alerts,"metrics":{"patients":len(patients),"need_attention":len(alerts),"appointments":db.execute("SELECT count(*) FROM appointment_slots WHERE doctor_id=? AND appointment_date>=?",(doctor_id,date.today().isoformat())).fetchone()[0]}})
 
 
@@ -566,12 +812,10 @@ def resolve_alert(alert_id):
     if not note:
         return jsonify({"error":"Укажите, как был обработан сигнал"}),400
     with get_db() as db:
-        row = db.execute(
-            """SELECT sr.* FROM secure_records sr
-               JOIN patient_doctors pd ON pd.patient_id=sr.patient_id
-               WHERE sr.id=? AND sr.record_type='alert' AND pd.doctor_id=?""",
-            (alert_id, g.user["entity_id"]),
-        ).fetchone()
+        doctor = db.execute("SELECT * FROM doctors WHERE id=?",(g.user["entity_id"],)).fetchone()
+        row = db.execute("SELECT * FROM secure_records WHERE id=? AND record_type='alert'",(alert_id,)).fetchone()
+        linked = row and db.execute("SELECT 1 FROM patient_doctors WHERE patient_id=? AND doctor_id=?",(row["patient_id"],g.user["entity_id"])).fetchone()
+        if row and not linked and not doctor["is_chief"] and not (doctor["is_on_call"] and row["severity"] in {"urgent","critical"}): row=None
         if not row:
             return jsonify({"error":"Сигнал не найден"}),404
         if row["status"] != "resolved":
@@ -588,12 +832,10 @@ def resolve_alert(alert_id):
 @require_auth("doctor")
 def acknowledge_alert(alert_id):
     with get_db() as db:
-        row = db.execute(
-            """SELECT sr.* FROM secure_records sr
-               JOIN patient_doctors pd ON pd.patient_id=sr.patient_id
-               WHERE sr.id=? AND sr.record_type='alert' AND pd.doctor_id=?""",
-            (alert_id, g.user["entity_id"]),
-        ).fetchone()
+        doctor = db.execute("SELECT * FROM doctors WHERE id=?",(g.user["entity_id"],)).fetchone()
+        row = db.execute("SELECT * FROM secure_records WHERE id=? AND record_type='alert'",(alert_id,)).fetchone()
+        linked = row and db.execute("SELECT 1 FROM patient_doctors WHERE patient_id=? AND doctor_id=?",(row["patient_id"],g.user["entity_id"])).fetchone()
+        if row and not linked and not doctor["is_chief"] and not (doctor["is_on_call"] and row["severity"] in {"urgent","critical"}): row=None
         if not row:
             return jsonify({"error":"Сигнал не найден"}),404
         if row["status"] == "new":
@@ -660,7 +902,7 @@ def withdraw_patient_consents():
 @require_auth("doctor")
 def update_doctor_profile():
     payload = request.get_json(silent=True) or {}
-    allowed = {"name", "specialty", "experience", "clinic", "price", "about"}
+    allowed = {"name", "specialty", "experience", "clinic", "price", "about", "work_days", "work_start", "work_end", "slot_minutes"}
     values = {key: payload[key] for key in allowed if key in payload}
     if not values:
         return jsonify({"error":"Нет данных для обновления"}),400
@@ -669,13 +911,71 @@ def update_doctor_profile():
     try:
         if "experience" in values: values["experience"] = max(0, int(values["experience"]))
         if "price" in values: values["price"] = max(2500, int(values["price"] or 2500))
+        if "slot_minutes" in values: values["slot_minutes"] = max(15, min(240, int(values["slot_minutes"])))
     except (TypeError, ValueError):
         return jsonify({"error":"Стаж и цена должны быть числами"}),400
+    if "work_days" in values:
+        days = [value for value in str(values["work_days"]).split(",") if value in {"1","2","3","4","5","6","7"}]
+        if not days: return jsonify({"error":"Выберите хотя бы один рабочий день"}),400
+        values["work_days"] = ",".join(dict.fromkeys(days))
+    for key in ("work_start", "work_end"):
+        if key in values:
+            try: datetime.strptime(str(values[key]), "%H:%M")
+            except ValueError: return jsonify({"error":"Рабочее время должно быть в формате ЧЧ:ММ"}),400
+    if "work_start" in values and "work_end" in values and values["work_start"] >= values["work_end"]:
+        return jsonify({"error":"Окончание рабочего дня должно быть позже начала"}),400
     with get_db() as db:
         assignments = ",".join(f"{key}=?" for key in values)
         db.execute(f"UPDATE doctors SET {assignments} WHERE id=?", (*values.values(),g.user["entity_id"]))
         doctor = db.execute("SELECT * FROM doctors WHERE id=?", (g.user["entity_id"],)).fetchone()
         return jsonify(dict(doctor))
+
+
+def require_chief(db):
+    doctor = db.execute("SELECT * FROM doctors WHERE id=? AND active=1",(g.user["entity_id"],)).fetchone()
+    return doctor if doctor and doctor["is_chief"] else None
+
+
+@app.get("/api/chief/dashboard")
+@require_auth("doctor")
+def chief_dashboard():
+    with get_db() as db:
+        if not require_chief(db): return jsonify({"error":"Доступ только для главного врача"}),403
+        doctors = [dict(row) for row in db.execute("SELECT d.*,u.email FROM doctors d LEFT JOIN users u ON u.role='doctor' AND u.entity_id=d.id ORDER BY d.active DESC,d.name").fetchall()]
+        patients = []
+        for row in db.execute("SELECT id FROM patients ORDER BY id").fetchall():
+            profile = latest(db,row["id"],"profile")
+            if profile:
+                linked = [item[0] for item in db.execute("SELECT d.name FROM doctors d JOIN patient_doctors pd ON pd.doctor_id=d.id WHERE pd.patient_id=? AND d.active=1",(row["id"],)).fetchall()]
+                patients.append({"id":row["id"],"full_name":profile["full_name"],"doctors":linked})
+        return jsonify({"doctors":doctors,"patients":patients,"metrics":{"doctors":sum(item["active"] for item in doctors),"patients":len(patients),"on_call":next((item["name"] for item in doctors if item["is_on_call"] and item["active"]),None)}})
+
+
+@app.put("/api/chief/on-call/<int:doctor_id>")
+@require_auth("doctor")
+def set_on_call(doctor_id):
+    with get_db() as db:
+        if not require_chief(db): return jsonify({"error":"Доступ только для главного врача"}),403
+        doctor = db.execute("SELECT * FROM doctors WHERE id=? AND active=1",(doctor_id,)).fetchone()
+        if not doctor: return jsonify({"error":"Врач не найден"}),404
+        db.execute("UPDATE doctors SET is_on_call=0")
+        db.execute("UPDATE doctors SET is_on_call=1 WHERE id=?",(doctor_id,))
+        return jsonify({"doctor_id":doctor_id,"doctor_name":doctor["name"],"is_on_call":True})
+
+
+@app.delete("/api/chief/doctors/<int:doctor_id>")
+@require_auth("doctor")
+def deactivate_doctor(doctor_id):
+    with get_db() as db:
+        chief = require_chief(db)
+        if not chief: return jsonify({"error":"Доступ только для главного врача"}),403
+        if doctor_id == chief["id"]: return jsonify({"error":"Нельзя удалить собственную учётную запись"}),409
+        doctor = db.execute("SELECT * FROM doctors WHERE id=? AND active=1",(doctor_id,)).fetchone()
+        if not doctor: return jsonify({"error":"Врач не найден или уже отключён"}),404
+        db.execute("UPDATE doctors SET active=0,is_on_call=0 WHERE id=?",(doctor_id,))
+        user = db.execute("SELECT id FROM users WHERE role='doctor' AND entity_id=?",(doctor_id,)).fetchone()
+        if user: db.execute("DELETE FROM sessions WHERE user_id=?",(user["id"],))
+        return jsonify({"doctor_id":doctor_id,"status":"deactivated","recoverable":True})
 
 
 @app.get("/api/schedule/doctor/<int:doctor_id>")
@@ -709,8 +1009,6 @@ def add_appointment():
     payload=request.get_json(silent=True) or {}
     doctor_id=int(payload.get("doctor_id",0)); patient_id=int(payload.get("patient_id",0))
     target=str(payload.get("date","")); time=str(payload.get("time",""))
-    if time not in SLOTS:
-        return jsonify({"error":"Недопустимый временной слот"}),400
     try:
         if date.fromisoformat(target) <= date.today():
             return jsonify({"error":"Выберите будущую дату"}),400
@@ -724,9 +1022,13 @@ def add_appointment():
             return jsonify({"error":"Нет доступа к этой записи"}),403
         if g.user["role"]=="doctor" and not db.execute("SELECT 1 FROM patient_doctors WHERE patient_id=? AND doctor_id=?",(patient_id,doctor_id)).fetchone():
             return jsonify({"error":"Пациент ещё не обращался к вам"}),403
-        doctor=db.execute("SELECT name FROM doctors WHERE id=?",(doctor_id,)).fetchone()
+        doctor=db.execute("SELECT * FROM doctors WHERE id=? AND active=1",(doctor_id,)).fetchone()
         if not doctor:
             return jsonify({"error":"Врач не найден"}),404
+        target_date = date.fromisoformat(target)
+        work_days = {int(value) for value in str(doctor["work_days"] or "").split(",") if value.isdigit()}
+        if target_date.isoweekday() not in work_days or time not in doctor_slots(doctor):
+            return jsonify({"error":"Время не входит в рабочее расписание врача"}),400
         status = "pending_patient" if g.user["role"]=="doctor" else "confirmed"
         try:
             record_id=insert_secure(db,patient_id,"appointment",{"doctor_id":doctor_id,"doctor_name":doctor["name"],"date":target,"time":time,"format":payload.get("format","Онлайн"),"reason":payload.get("reason","Консультация"),"created_by":g.user["role"]},status=status)
@@ -811,7 +1113,14 @@ def post_chat(patient_id):
 
 
 def notification_items(db, user):
-    patient_ids=[user["entity_id"]] if user["role"]=="patient" else [row[0] for row in db.execute("SELECT patient_id FROM patient_doctors WHERE doctor_id=?",(user["entity_id"],)).fetchall()]
+    linked_ids = set()
+    doctor_profile = None
+    if user["role"]=="patient":
+        patient_ids=[user["entity_id"]]
+    else:
+        linked_ids={row[0] for row in db.execute("SELECT patient_id FROM patient_doctors WHERE doctor_id=?",(user["entity_id"],)).fetchall()}
+        doctor_profile=db.execute("SELECT * FROM doctors WHERE id=?",(user["entity_id"],)).fetchone()
+        patient_ids=[row[0] for row in db.execute("SELECT id FROM patients").fetchall()] if doctor_profile and (doctor_profile["is_chief"] or doctor_profile["is_on_call"]) else list(linked_ids)
     read={row[0] for row in db.execute("SELECT event_key FROM notification_reads WHERE user_id=?",(user["id"],)).fetchall()}
     output=[]
     for patient_id in patient_ids:
@@ -819,7 +1128,10 @@ def notification_items(db, user):
         if not profile: continue
         if user["role"]=="doctor":
             for item in records(db,patient_id,"alert",True):
-                if item["title"]!="Жалоба на переносимость": output.append({"key":f"alert:{item['id']}","title":item["title"],"text":f"{profile['full_name']}: {item['description']}","created_at":item["created_at"]})
+                can_see = patient_id in linked_ids or doctor_profile["is_chief"] or (doctor_profile["is_on_call"] and item.get("severity") in {"urgent","critical"})
+                if can_see and item["title"]!="Жалоба на переносимость": output.append({"key":f"alert:{item['id']}","title":item["title"],"text":f"{profile['full_name']}: {item['description']}","created_at":item["created_at"]})
+            if patient_id not in linked_ids:
+                continue
             for item in records(db,patient_id,"message",True):
                 if item["sender"]=="patient" and item.get("doctor_id")==user["entity_id"]: output.append({"key":f"message:{item['id']}","title":"Новое сообщение","text":f"{profile['full_name']}: {item['body']}","created_at":item["created_at"]})
             for item in records(db,patient_id,"side_effect",True):
@@ -832,6 +1144,23 @@ def notification_items(db, user):
                 title="Пациент подтвердил приём" if item["action"]=="confirmed" else "Пациент отказался от приёма" if item["action"]=="declined" else "Пациент отменил запись"
                 output.append({"key":f"appointment_event:{item['id']}","title":title,"text":f"{profile['full_name']}: {item['date']} в {item['time']}","created_at":item["created_at"]})
         else:
+            for item in records(db,patient_id,"questionnaire_assignment",True):
+                if item.get("status")=="active" and item.get("due_date")==date.today().isoformat():
+                    output.append({"key":f"questionnaire_due:{item['id']}:{item['due_date']}","title":"Сегодня нужно пройти опросник",
+                        "text":item["title"],"created_at":f"{item['due_date']}T08:00:00"})
+            adherence = medication_adherence(db,patient_id)
+            for item in records(db,patient_id,"prescription",True):
+                state = adherence.get(item["id"])
+                if item.get("status")!="active" or not state or state["taken_today"]: continue
+                for reminder_time in item.get("schedule_times",[]):
+                    try:
+                        reminder_at=datetime.fromisoformat(f"{date.today().isoformat()}T{reminder_time}:00").replace(tzinfo=MOSCOW_TZ)
+                        if datetime.now(MOSCOW_TZ) >= reminder_at-timedelta(minutes=15):
+                            output.append({"key":f"medication_reminder:{item['id']}:{date.today().isoformat()}:{reminder_time}",
+                                "title":"Напоминание о препарате","text":f"{item['name']} — {item['dose']}, время {reminder_time}",
+                                "created_at":reminder_at.isoformat(timespec="seconds")})
+                    except (TypeError,ValueError):
+                        continue
             for item in records(db,patient_id,"message",True):
                 if item["sender"]=="doctor": output.append({"key":f"message:{item['id']}","title":"Сообщение врача","text":item["body"],"created_at":item["created_at"]})
             for item in records(db,patient_id,"appointment",True):
@@ -888,9 +1217,11 @@ def checkin():
     patient_id=g.user["entity_id"]
     with get_db() as db:
         previous_checkin=latest(db,patient_id,"checkin")
+        if previous_checkin:
+            previous_checkin["anxiety"] = normalized_anxiety(previous_checkin)
         risk=evaluate_safety_risk(payload,previous_checkin)
         safety_answers=risk.pop("answers")
-        record_id=insert_secure(db,patient_id,"checkin",{"mood":mood,"anxiety":anxiety,"sleep":sleep,"medication_taken":bool(payload.get("medication_taken")),"side_effects":str(payload.get("side_effects","Нет")),"note":str(payload.get("note","")),"safety":safety_answers,"risk_level":risk["level"],"risk_ruleset":risk["ruleset_version"],"scale_version":2})
+        record_id=insert_secure(db,patient_id,"checkin",{"mood":mood,"anxiety":anxiety,"sleep":sleep,"side_effects":str(payload.get("side_effects","Нет")),"note":str(payload.get("note","")),"safety":safety_answers,"risk_level":risk["level"],"risk_ruleset":risk["ruleset_version"],"scale_version":3})
         stats=db.execute("SELECT * FROM patient_stats WHERE patient_id=?",(patient_id,)).fetchone()
         today=date.today(); awarded=0
         if not stats or stats["last_checkin_date"] != today.isoformat():
@@ -921,10 +1252,154 @@ def assessment():
     score=sum(answers); level="Минимальный" if score<=4 else "Умеренный" if score<=9 else "Средний" if score<=14 else "Высокий"
     patient_id=g.user["entity_id"]
     with get_db() as db:
-        first=not db.execute("SELECT 1 FROM secure_records WHERE patient_id=? AND record_type='assessment'",(patient_id,)).fetchone()
+        previous=db.execute("SELECT * FROM secure_records WHERE patient_id=? AND record_type='assessment' ORDER BY id DESC LIMIT 1",(patient_id,)).fetchone()
+        first=previous is None
+        if previous:
+            next_date=date.fromisoformat(previous["created_at"][:10])+timedelta(days=7)
+            if date.today() < next_date:
+                return jsonify({"error":f"Следующий еженедельный опрос доступен {next_date.strftime('%d.%m.%Y')}"}),409
         record_id=insert_secure(db,patient_id,"assessment",{"scale":"GAD-7","answers":answers,"score":score,"level":level})
         if first: db.execute("UPDATE patient_stats SET points=points+50 WHERE patient_id=?",(patient_id,))
     return jsonify({"id":record_id,"score":score,"level":level,"points_awarded":50 if first else 0,"message":"Скрининг не является диагнозом."}),201
+
+
+@app.post("/api/patient/medication-intakes")
+@require_auth("patient")
+def medication_intake():
+    payload=request.get_json(silent=True) or {}
+    try:
+        prescription_id=int(payload.get("prescription_id",0))
+    except (TypeError, ValueError):
+        return jsonify({"error":"Выберите назначение"}),400
+    patient_id=g.user["entity_id"]
+    today=date.today().isoformat()
+    with get_db() as db:
+        row=db.execute(
+            "SELECT * FROM secure_records WHERE id=? AND patient_id=? AND record_type='prescription' AND status='active'",
+            (prescription_id,patient_id),
+        ).fetchone()
+        if not row:
+            return jsonify({"error":"Активное назначение не найдено"}),404
+        prescription=decrypt_record(row)
+        existing=next((item for item in records(db,patient_id,"medication_intake",True)
+                       if item.get("prescription_id")==prescription_id and item.get("taken_on")==today),None)
+        if existing:
+            return jsonify(existing|{"status":"already_recorded"})
+        record_id=insert_secure(db,patient_id,"medication_intake",{
+            "prescription_id":prescription_id,
+            "medicine":prescription["name"],
+            "taken_on":today,
+        },status="confirmed")
+        for alert_row in db.execute(
+            "SELECT * FROM secure_records WHERE patient_id=? AND record_type='alert' AND status IN ('new','acknowledged')",
+            (patient_id,),
+        ).fetchall():
+            alert=decrypt_record(alert_row)
+            if alert.get("alert_kind")=="medication_adherence" and alert.get("prescription_id")==prescription_id:
+                db.execute("UPDATE secure_records SET status='resolved' WHERE id=?",(alert_row["id"],))
+        return jsonify({"id":record_id,"status":"confirmed","taken_on":today}),201
+
+
+@app.get("/api/questionnaires")
+@require_auth()
+def questionnaires():
+    requested = request.args.get("audience")
+    audience = "patient" if g.user["role"] == "patient" else requested if requested in {"patient","doctor"} else "doctor"
+    return jsonify([{key:value for key,value in item.items() if key != "scoring"} for item in questionnaire_catalog() if item["audience"] == audience])
+
+
+@app.post("/api/doctor/patients/<int:patient_id>/questionnaire-assignments")
+@require_auth("doctor")
+def assign_questionnaire(patient_id):
+    payload = request.get_json(silent=True) or {}
+    code = str(payload.get("questionnaire_code", "")).strip().lower()
+    questionnaire = questionnaire_by_code(code, "patient")
+    if not questionnaire:
+        return jsonify({"error":"Опросник не найден"}),404
+    try:
+        due_date = date.fromisoformat(str(payload.get("due_date", "")))
+        repeat_weeks = max(0, min(52, int(payload.get("repeat_weeks", 1))))
+    except (TypeError, ValueError):
+        return jsonify({"error":"Проверьте дату и периодичность"}),400
+    if due_date < date.today():
+        return jsonify({"error":"Дата опроса не может быть в прошлом"}),400
+    doctor_id = g.user["entity_id"]
+    with get_db() as db:
+        if not db.execute("SELECT 1 FROM patient_doctors WHERE patient_id=? AND doctor_id=?", (patient_id,doctor_id)).fetchone():
+            return jsonify({"error":"Нет доступа к пациенту"}),403
+        doctor = db.execute("SELECT name FROM doctors WHERE id=?", (doctor_id,)).fetchone()
+        document = {
+            "questionnaire_code":code, "title":questionnaire["title"], "due_date":due_date.isoformat(),
+            "repeat_weeks":repeat_weeks, "doctor_id":doctor_id, "doctor_name":doctor["name"],
+        }
+        record_id = insert_secure(db,patient_id,"questionnaire_assignment",document,status="active")
+        return jsonify(document|{"id":record_id,"status":"active"}),201
+
+
+@app.post("/api/patient/questionnaire-responses")
+@require_auth("patient")
+def submit_questionnaire():
+    payload = request.get_json(silent=True) or {}
+    try: assignment_id = int(payload.get("assignment_id",0))
+    except (TypeError, ValueError): return jsonify({"error":"Назначение не найдено"}),400
+    patient_id = g.user["entity_id"]
+    with get_db() as db:
+        row = db.execute("SELECT * FROM secure_records WHERE id=? AND patient_id=? AND record_type='questionnaire_assignment' AND status='active'", (assignment_id,patient_id)).fetchone()
+        if not row: return jsonify({"error":"Активное назначение опросника не найдено"}),404
+        assignment = decrypt_record(row)
+        if assignment.get("due_date", "9999-12-31") > date.today().isoformat():
+            return jsonify({"error":"Опросник станет доступен в назначенный день"}),409
+        questionnaire = questionnaire_by_code(assignment["questionnaire_code"], "patient")
+        if not questionnaire: return jsonify({"error":"Файл опросника недоступен"}),404
+        try: answers,total,level,recommendation = score_questionnaire(questionnaire,payload.get("answers"))
+        except ValueError as error: return jsonify({"error":str(error)}),400
+        document = {
+            "assignment_id":assignment_id,"questionnaire_code":questionnaire["code"],"title":questionnaire["title"],
+            "answers":answers,"score":total,"max_score":questionnaire["max_score"],"level":level,
+            "recommendation":recommendation,"source":"patient","doctor_id":assignment["doctor_id"],
+        }
+        record_id = insert_secure(db,patient_id,"questionnaire_response",document,status="completed")
+        db.execute("UPDATE secure_records SET status='completed' WHERE id=?", (assignment_id,))
+        repeat_weeks = int(assignment.get("repeat_weeks",0) or 0)
+        if repeat_weeks:
+            next_due = date.fromisoformat(assignment["due_date"]) + timedelta(weeks=repeat_weeks)
+            while next_due <= date.today():
+                next_due += timedelta(weeks=repeat_weeks)
+            next_document = {key:assignment[key] for key in ("questionnaire_code","title","repeat_weeks","doctor_id","doctor_name")}
+            next_document["due_date"] = next_due.isoformat()
+            insert_secure(db,patient_id,"questionnaire_assignment",next_document,status="active")
+        if questionnaire["code"].startswith("phq") and any(item["question_id"]=="9" and item["score"]>0 for item in answers):
+            insert_secure(db,patient_id,"alert",{
+                "title":"Срочный сигнал по PHQ-9","description":"В ответах отмечены мысли о смерти или самоповреждении.",
+                "recommendation":"Связаться с пациентом и провести клиническую оценку риска.","alert_kind":"questionnaire",
+                "questionnaire_response_id":record_id,"ruleset_version":"questionnaire-safety-v1",
+            },severity="urgent",status="new")
+        return jsonify(document|{"id":record_id,"status":"completed"}),201
+
+
+@app.post("/api/doctor/patients/<int:patient_id>/clinical-assessments")
+@require_auth("doctor")
+def submit_clinical_assessment(patient_id):
+    payload = request.get_json(silent=True) or {}
+    code = str(payload.get("questionnaire_code","")).strip().lower()
+    questionnaire = questionnaire_by_code(code,"doctor")
+    if not questionnaire: return jsonify({"error":"Клиническая шкала не найдена"}),404
+    doctor_id = g.user["entity_id"]
+    with get_db() as db:
+        if not db.execute("SELECT 1 FROM patient_doctors WHERE patient_id=? AND doctor_id=?",(patient_id,doctor_id)).fetchone():
+            return jsonify({"error":"Нет доступа к пациенту"}),403
+        try: answers,total,level,recommendation = score_questionnaire(questionnaire,payload.get("answers"))
+        except ValueError as error: return jsonify({"error":str(error)}),400
+        doctor = db.execute("SELECT name FROM doctors WHERE id=?",(doctor_id,)).fetchone()
+        document = {"questionnaire_code":code,"title":questionnaire["title"],"answers":answers,"score":total,
+            "max_score":questionnaire["max_score"],"level":level,"recommendation":recommendation,
+            "source":"doctor","doctor_id":doctor_id,"doctor_name":doctor["name"]}
+        record_id = insert_secure(db,patient_id,"clinical_assessment",document,status="completed")
+        critical = questionnaire.get("scoring",{}).get("critical_flags")
+        if critical and any(str(item["question_id"])==str(critical.get("question_id")) and item["score"]>=int(critical.get("threshold_score",999)) for item in answers):
+            insert_secure(db,patient_id,"alert",{"title":"Критический результат клинической шкалы","description":critical.get("alert_message","Требуется оценка врача"),
+                "recommendation":"Немедленно оценить безопасность пациента.","alert_kind":"clinical_assessment","clinical_assessment_id":record_id},severity="critical",status="new")
+        return jsonify(document|{"id":record_id,"status":"completed"}),201
 
 
 @app.post("/api/doctor/patients/<int:patient_id>/prescriptions")
@@ -932,19 +1407,33 @@ def assessment():
 def prescribe(patient_id):
     payload=request.get_json(silent=True) or {}
     doctor_id=g.user["entity_id"]
-    try: medicine_id=int(payload.get("medicine_id",0))
-    except (TypeError,ValueError): return jsonify({"error":"Выберите препарат"}),400
+    try: medicine_id=int(payload.get("medicine_id",0) or 0)
+    except (TypeError,ValueError): return jsonify({"error":"Проверьте препарат"}),400
+    custom_name=str(payload.get("custom_name","")).strip()
     dose=str(payload.get("dose","")).strip(); frequency=str(payload.get("frequency","")).strip()
     if not dose or not frequency: return jsonify({"error":"Укажите дозировку и режим приёма"}),400
+    schedule_times = payload.get("schedule_times", [])
+    if not isinstance(schedule_times, list) or len(schedule_times) > 8:
+        return jsonify({"error":"Укажите не более восьми напоминаний в сутки"}),400
+    try:
+        schedule_times = sorted({datetime.strptime(str(value), "%H:%M").strftime("%H:%M") for value in schedule_times})
+    except ValueError:
+        return jsonify({"error":"Время напоминания должно быть в формате ЧЧ:ММ"}),400
+    if not medicine_id and not (2 <= len(custom_name) <= 200):
+        return jsonify({"error":"Выберите препарат из базы или введите его название"}),400
     with get_db() as db:
         if not db.execute("SELECT 1 FROM patient_doctors WHERE patient_id=? AND doctor_id=?",(patient_id,doctor_id)).fetchone():
             return jsonify({"error":"Нет доступа к пациенту"}),403
-        medicine=db.execute("SELECT * FROM medicines WHERE id=?",(medicine_id,)).fetchone()
+        medicine=db.execute("SELECT * FROM medicines WHERE id=?",(medicine_id,)).fetchone() if medicine_id else None
         doctor=db.execute("SELECT name FROM doctors WHERE id=?",(doctor_id,)).fetchone()
-        if not medicine: return jsonify({"error":"Препарат не найден"}),404
-        document={"medicine_id":medicine_id,"name":medicine["name"],"ingredient":medicine["ingredient"],"dose":dose,"frequency":frequency,
+        if medicine_id and not medicine: return jsonify({"error":"Препарат не найден"}),404
+        document={"medicine_id":medicine_id or None,"name":medicine["name"] if medicine else custom_name,
+            "ingredient":medicine["ingredient"] if medicine else str(payload.get("custom_ingredient","")).strip(),"dose":dose,"frequency":frequency,
             "doctor_id":doctor_id,"doctor_name":doctor["name"],"started_at":date.today().isoformat(),
-            "common_effects":medicine["common_effects"].split("|"),"urgent_effects":medicine["urgent_effects"].split("|"),"monitoring":medicine["monitoring"]}
+            "schedule_times":schedule_times,"custom_medicine":medicine is None,
+            "common_effects":medicine["common_effects"].split("|") if medicine else [],
+            "urgent_effects":medicine["urgent_effects"].split("|") if medicine else [],
+            "monitoring":medicine["monitoring"] if medicine else "Контроль переносимости по решению лечащего врача"}
         record_id=insert_secure(db,patient_id,"prescription",document,status="active")
         return jsonify(document|{"id":record_id,"status":"active"}),201
 

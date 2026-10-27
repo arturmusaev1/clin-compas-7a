@@ -1,6 +1,8 @@
 services:
   api:
-    build: ./backend
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
     environment:
       DATABASE_PATH: /app/data/clinical_compass.db
       ALLOWED_ORIGINS: http://localhost:5173,http://localhost:5174

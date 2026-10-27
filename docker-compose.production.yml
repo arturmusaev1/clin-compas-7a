@@ -1,6 +1,8 @@
 services:
   api:
-    build: ./backend
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
     environment:
       DATABASE_PATH: /app/data/clinical_compass.db
       ALLOWED_ORIGINS: https://${DOCTOR_DOMAIN},https://${PATIENT_DOMAIN}
